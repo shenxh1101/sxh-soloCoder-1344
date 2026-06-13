@@ -6,7 +6,7 @@ import signal
 import subprocess
 from typing import List, Optional
 
-from .config import load_config, AppConfig
+from .config import load_config, AppConfig, ConfigValidationError, CircularDependencyError
 from .process_manager import ProcessManager, ServiceStatus
 from .health_checker import HealthChecker
 from .log_aggregator import LogAggregator
@@ -110,25 +110,61 @@ class MServiceCLI:
         return 0
 
     def _setup_health_check_handlers(self) -> None:
-        def on_unhealthy(name: str) -> None:
+        def on_unhealthy(name: str, reason: str, failed_count: int, retries: int) -> None:
             svc = self.app_config.get_service(name)
-            color = svc.color if svc else "white"
-            print(colorize(f"[健康检查] {name} 不健康", "yellow"))
+            svc_color = svc.color if svc else "white"
+            name_colored = colorize(name, svc_color, bold=True)
+            progress = f"[{failed_count}/{retries}]"
+            print(
+                colorize(
+                    f"⚠  {name_colored} 不健康 {progress}: {reason}",
+                    "yellow",
+                )
+            )
 
         def on_healthy(name: str) -> None:
             svc = self.app_config.get_service(name)
-            color = svc.color if svc else "white"
-            print(colorize(f"[健康检查] {name} 恢复健康", "green"))
+            svc_color = svc.color if svc else "white"
+            name_colored = colorize(name, svc_color, bold=True)
+            print(colorize(f"✓  {name_colored} 健康检查通过", "green"))
 
-        def on_restart(name: str, count: int) -> None:
+        def on_restart(name: str, attempt: int, max_restarts: int, reason: str) -> None:
             svc = self.app_config.get_service(name)
-            color = svc.color if svc else "white"
-            print(colorize(f"[健康检查] 重启 {name} (第 {count} 次)", "yellow"))
+            svc_color = svc.color if svc else "white"
+            name_colored = colorize(name, svc_color, bold=True)
+            progress = f"(第 {attempt}/{max_restarts} 次)"
+            print(
+                colorize(
+                    f"↻  正在重启 {name_colored} {progress}，原因: {reason}",
+                    "yellow",
+                )
+            )
 
-        def on_max_restarts(name: str) -> None:
+        def on_max_restarts(name: str, max_restarts: int, reason: str) -> None:
             svc = self.app_config.get_service(name)
-            color = svc.color if svc else "white"
-            print(colorize(f"[健康检查] {name} 已达到最大重启次数", "red"))
+            svc_color = svc.color if svc else "white"
+            name_colored = colorize(name, svc_color, bold=True)
+            print()
+            print(
+                colorize(
+                    f"✗  {name_colored} 已达到最大重启次数 ({max_restarts}次)，停止自动重启",
+                    "bright_red",
+                    bold=True,
+                )
+            )
+            print(
+                colorize(
+                    f"   最后失败原因: {reason}",
+                    "red",
+                )
+            )
+            print(
+                colorize(
+                    f"   请手动排查问题后使用 'restart {name}' 命令重新启动",
+                    "bright_black",
+                )
+            )
+            print()
 
         self.health_checker.on_unhealthy = on_unhealthy
         self.health_checker.on_healthy = on_healthy
@@ -199,10 +235,55 @@ class MServiceCLI:
 
         if args.topo:
             print(self.visualizer.render_simple())
+            print()
+            print(self._render_detailed_status())
         else:
             print(self.visualizer.render_status_table())
+            print(self._render_detailed_status())
 
         return 0
+
+    def _render_detailed_status(self) -> str:
+        lines = []
+        has_issues = False
+
+        for svc_cfg in self.app_config.services:
+            name = svc_cfg.name
+            inst = self.process_manager.get_instance(name)
+            if inst is None:
+                continue
+
+            status = inst.status
+            hc_cfg = svc_cfg.health_check
+            hc_reason = self.health_checker.get_last_failure_reason(name)
+            failed_count = self.health_checker.get_failed_count(name)
+
+            if status == ServiceStatus.UNHEALTHY and hc_reason:
+                has_issues = True
+                svc_color = svc_cfg.color
+                name_colored = colorize(name, svc_color, bold=True)
+                retries_info = ""
+                if hc_cfg:
+                    retries_info = f" [{failed_count}/{hc_cfg.retries}]"
+                lines.append(
+                    colorize(f"  ⚠ {name_colored}{retries_info}: {hc_reason}", "yellow")
+                )
+            elif status == ServiceStatus.ERROR:
+                has_issues = True
+                svc_color = svc_cfg.color
+                name_colored = colorize(name, svc_color, bold=True)
+                reason = hc_reason if hc_reason else "已达到最大重启次数"
+                lines.append(
+                    colorize(
+                        f"  ✗ {name_colored}: {reason}（重启次数: {inst.restart_count}/{svc_cfg.max_restarts}）",
+                        "bright_red",
+                    )
+                )
+
+        if has_issues:
+            header = colorize("健康检查详情:", "cyan")
+            return header + "\n" + "\n".join(lines)
+        return ""
 
     def cmd_logs(self, args: argparse.Namespace) -> int:
         self._load()
@@ -433,8 +514,29 @@ def main() -> int:
     except KeyboardInterrupt:
         print()
         return 130
+    except FileNotFoundError as e:
+        print(colorize(f"❌ {e}", "bright_red", bold=True))
+        return 1
+    except CircularDependencyError as e:
+        print(colorize(f"❌ {e.message}", "bright_red", bold=True))
+        if e.details:
+            for d in e.details:
+                print(colorize(f"   🔴 {d}", "red"))
+        print()
+        print(colorize("请修复循环依赖后重新运行", "yellow"))
+        return 1
+    except ConfigValidationError as e:
+        print(colorize(f"❌ {e.message}", "bright_red", bold=True))
+        if e.details:
+            for d in e.details:
+                print(colorize(f"   • {d}", "red"))
+        print()
+        print(colorize("请修复配置文件后重新运行", "yellow"))
+        return 1
     except Exception as e:
         print(colorize(f"错误: {e}", "red"))
+        import traceback
+        traceback.print_exc()
         return 1
 
 
