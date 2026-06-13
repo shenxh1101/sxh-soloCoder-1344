@@ -1,0 +1,52 @@
+global:
+  log_dir: ./logs
+  snapshot_file: ./.mservice_snapshot.json
+  health_check_interval: 5
+
+services:
+  - name: service-a
+    repo_path: ./test_services
+    command: python simple_server.py service-a
+    color: green
+    health_check:
+      type: http
+      port: 8001
+      path: /health
+      timeout: 2
+      retries: 3
+    environment:
+      PORT: 8001
+    max_restarts: 3
+
+  - name: service-b
+    repo_path: ./test_services
+    command: python simple_server.py service-b
+    color: blue
+    depends_on:
+      - service-a
+    health_check:
+      type: http
+      port: 8002
+      path: /health
+      timeout: 2
+      retries: 3
+    environment:
+      PORT: 8002
+    max_restarts: 3
+
+  - name: service-c
+    repo_path: ./test_services
+    command: python simple_server.py service-c
+    color: magenta
+    depends_on:
+      - service-a
+      - service-b
+    health_check:
+      type: http
+      port: 8003
+      path: /health
+      timeout: 2
+      retries: 3
+    environment:
+      PORT: 8003
+    max_restarts: 3
